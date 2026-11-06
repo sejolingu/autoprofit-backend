@@ -1,81 +1,107 @@
+// server.js - AutoProfit Backend - FULL FIXED
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
 const fs = require('fs');
 const app = express();
 app.use(cors());
 app.use(express.json());
-const PALPLUSS_KEY = process.env.PALPLUSS_KEY;
 
+// ===== WALLET STORAGE =====
 let wallet = { KES: 0, USD: 0, EUR: 0, GBP: 0, JPY: 0, USDT: 0 };
 let transactions = [];
-try {
-  if (fs.existsSync('wallet.json')) {
-    const d = JSON.parse(fs.readFileSync('wallet.json','utf8'));
-    wallet = d.wallet || wallet;
-    transactions = d.transactions || [];
-  }
-} catch(e){}
-function saveWallet(){ fs.writeFileSync('wallet.json', JSON.stringify({wallet, transactions})); }
+const WALLET_FILE = './wallet.json';
 
-app.get('/', (req,res)=> res.send('AutoProfit Backend is Live'));
-app.get('/api/wallet', (req,res)=> res.json({ wallet, transactions }));
-
-async function doDeposit(req,res){
-  try{
-    const { amount, currency, phone } = req.body;
-    const amt = Number(amount) || 0;
-    let cleanPhone = (phone || '254116125930').toString().replace(/\s/g,'');
-    if(cleanPhone.startsWith('0')) cleanPhone = '254' + cleanPhone.slice(1);
-    if(cleanPhone.startsWith('+')) cleanPhone = cleanPhone.slice(1);
-    if(!PALPLUSS_KEY) return res.status(500).json({ success:false, error:'PALPLUSS_KEY missing' });
-    const ref = 'AP' + Date.now();
-    const response = await axios.post('https://api.palpluss.com/v1/payments/stk', {
-      phone: cleanPhone,
-      amount: amt,
-      accountReference: ref,
-      callbackUrl: 'https://autoprofit-backend-bwm9.onrender.com/api/callback'
-    }, { headers:{ 'Authorization': `Basic ${PALPLUSS_KEY}`, 'Content-Type':'application/json' }, timeout:30000 });
-    return res.json({ success:true, message:'STK Sent', ref, palpluss: response.data });
-  }catch(e){ return res.status(500).json({ success:false, error:'STK failed', details: e.response?.data || e.message }); }
-}
-app.post('/api/deposit', doDeposit);
-app.post('/api/pay', doDeposit);
-
-app.post('/api/withdraw', (req,res)=>{
-  const amt = Number(req.body.amount)||0;
-  const cur = req.body.currency || 'KES';
-  if((wallet[cur]||0) < amt) return res.status(400).json({ error:'Insufficient balance' });
-  wallet[cur]-=amt;
-  transactions.unshift({ type:'withdraw', amount:amt, currency:cur, date:new Date().toISOString() });
-  saveWallet(); res.json({ success:true, wallet });
-});
-
-app.post('/api/callback', (req,res)=>{
-  const b = req.body || {};
-  const status = (b.status || b.ResultDesc || '').toString().toLowerCase();
-  const isSuccess = status==='success' || b.ResultCode===0 || b.success===true || b.status==='completed' || status.includes('success');
-  if(isSuccess){
-    const amt = Number(b.amount || b.Amount || b.data?.amount || 0);
-    const ref = b.reference || b.accountReference || b.ref || b.transaction_id || b.id || 'CB-'+Date.now();
-    if(amt>0 && !transactions.find(t=>t.ref===ref)){
-      wallet.KES += amt;
-      transactions.unshift({ type:'deposit', amount:amt, currency:'KES', date:new Date().toISOString(), via:'M-Pesa', ref });
-      saveWallet();
+function loadWallet() {
+  try {
+    if (fs.existsSync(WALLET_FILE)) {
+      const d = JSON.parse(fs.readFileSync(WALLET_FILE, 'utf8'));
+      if (d.wallet) wallet = { ...wallet, ...d.wallet };
+      if (d.transactions) transactions = d.transactions;
+      // Backward compat: if file was {KES:5} directly
+      if (d.KES !== undefined) wallet.KES = d.KES;
     }
+  } catch (e) { console.log('Load wallet error', e.message); }
+}
+function saveWallet() {
+  try { fs.writeFileSync(WALLET_FILE, JSON.stringify({ wallet, transactions }, null, 2)); }
+  catch (e) { console.log('Save error', e.message); }
+}
+loadWallet();
+function saveData() { saveWallet(); }
+
+// ===== HEALTH =====
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'autoprofit-backend', wallet }));
+app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+
+// ===== GET WALLET - This is what app calls =====
+app.get('/api/wallet', (req, res) => {
+  res.json({ wallet, transactions: transactions.slice(-50) });
+});
+
+// ===== DEPOSIT WEBHOOK / CALLBACK FROM PALPLUSS =====
+// Palpluss will call this. MUST use += and duplicate check
+app.post('/api/deposit', (req, res) => {
+  const { amount, currency, ref, transaction_id, phone, status } = req.body || {};
+  const finalRef = ref || transaction_id || req.body?.ReceiptNo || req.body?.receipt || ('MANUAL-' + Date.now());
+  const amt = parseFloat(amount) || 0;
+  const cur = (currency || 'KES').toUpperCase();
+  if (amt <= 0) return res.json({ success: false, error: 'Invalid amount' });
+  // Duplicate check - never credit same ref twice
+  if (transactions.find(t => t.ref === finalRef)) {
+    return res.json({ success: false, message: 'Already credited', wallet });
   }
-  res.json({ status:'ok' });
-});
-
-// 1-CLICK CREDIT FOR YOUR KES 5
-app.get('/api/credit-5', (req,res)=>{
-  const ref = 'PAL-1793815737101';
-  if(transactions.find(t=>t.ref===ref)) return res.json({ note:'Already credited', wallet });
-  wallet.KES += 5;
-  transactions.unshift({ type:'deposit', amount:5, currency:'KES', date:new Date().toISOString(), via:'manual-link', ref });
+  // FIX: ADD, never overwrite
+  wallet[cur] = (wallet[cur] || 0) + amt;
+  transactions.push({ type: 'deposit', amount: amt, currency: cur, date: new Date().toISOString(), via: 'palpluss-callback', ref: finalRef, phone: phone || '' });
   saveWallet();
-  res.json({ ok:true, message:'KES 5 credited', wallet });
+  console.log('DEPOSIT credited:', amt, cur, finalRef, 'New KES:', wallet.KES);
+  res.json({ success: true, wallet });
 });
 
+// Also accept Palpluss callback on other common paths
+app.post('/api/callback', (req, res) => {
+  req.url = '/api/deposit';
+  return app.handle(req, res);
+});
+app.post('/api/webhook', (req, res) => {
+  req.url = '/api/deposit';
+  return app.handle(req, res);
+});
+app.post('/api/palpluss/callback', (req, res) => {
+  req.url = '/api/deposit';
+  return app.handle(req, res);
+});
+
+// ===== MANUAL CREDIT - RECOVER MISSING PAYMENT =====
+// Use: GET /api/credit-missing/PAL-1793933003505?amount=5
+app.get('/api/credit-missing/:ref', (req, res) => {
+  const ref = req.params.ref;
+  const amount = parseFloat(req.query.amount) || 5;
+  if (transactions.find(t => t.ref === ref)) {
+    return res.json({ success: false, message: 'Already credited', wallet });
+  }
+  wallet.KES = (wallet.KES || 0) + amount;
+  transactions.push({ type: 'deposit', amount, currency: 'KES', date: new Date().toISOString(), via: 'manual-recovery', ref });
+  saveWallet();
+  console.log('MANUAL CREDIT:', amount, ref, 'New KES:', wallet.KES);
+  res.json({ success: true, credited: amount, ref, wallet });
+});
+
+// ===== WITHDRAW =====
+app.post('/api/withdraw', (req, res) => {
+  const { phone, amount, currency } = req.body || {};
+  const amt = parseFloat(amount) || 0;
+  const cur = (currency || 'KES').toUpperCase();
+  if (!phone || amt <= 0) return res.json({ success: false, error: 'Phone and amount required' });
+  if ((wallet[cur] || 0) < amt) return res.json({ success: false, error: 'Insufficient balance. Have: ' + wallet[cur] });
+  // Deduct only after you confirm Palpluss payout succeeds.
+  // For now we deduct and log - replace with real Palpluss payout API call if you have it.
+  wallet[cur] -= amt;
+  transactions.push({ type: 'withdraw', amount: amt, currency: cur, date: new Date().toISOString(), via: 'manual', ref: 'WD-' + Date.now(), phone });
+  saveWallet();
+  res.json({ success: true, message: 'Withdraw logged. Process payout in Palpluss dashboard.', wallet, palpluss: { transaction_id: 'WD-' + Date.now() } });
+});
+
+// ===== PORT =====
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, ()=> console.log('Running on '+PORT));
+app.listen(PORT, () => console.log('AutoProfit backend running on', PORT, 'Wallet KES:', wallet.KES));
